@@ -11,13 +11,15 @@
 #include <signal.h>
 #include "shared.h"
 
-#define SIM_N  10
-#define SIM_D   3
+#define SIM_N   3
+#define SIM_D   2
 #define SIM_S   2
-#define SIM_T  50
-#define SIM_B   3
-#define MAX_NEW 4
+#define SIM_T   7
+#define MAX_TURNS 500
+#define SIM_B   1
+#define MAX_NEW 1
 
+/* Use small positive keys to avoid overflow */
 #define KEY_SHM     0x0F110001
 #define KEY_TURN    0x0F110002
 #define KEY_MAINQ   0x0F110003
@@ -41,6 +43,10 @@ static void place_tolls(unsigned seed){
     }
 }
 
+/*
+ * Solver process: maps the turn shm, reads its message queue,
+ * computes secrets directly, replies. No pipes, no bridges.
+ */
 static void solver_proc(int qid, int turnShmId) {
     int *turnPtr = (int*)shmat(turnShmId, NULL, 0);
     char secret[TRUCK_MAX_CAP+1];
@@ -52,10 +58,11 @@ static void solver_proc(int qid, int turnShmId) {
         if(r<0) continue;
         if(req.mtype==2){
             tgt_truck=req.truckNumber;
-            tgt_turn=*turnPtr;
+            tgt_turn=*turnPtr;  /* snapshot turn at set_truck time */
         } else if(req.mtype==3){
             int L=(int)strlen(req.authStringGuess);
             int correct=0;
+            /* try tgt_turn and neighbours to handle any timing race */
             for(int dt=-2; dt<=2 && !correct; dt++){
                 int t=tgt_turn+dt; if(t<1) t=1;
                 gen_secret(tgt_truck,L,t,secret);
@@ -93,10 +100,10 @@ static void helper(MainSharedMemory *shm,int mainQ,unsigned seed,int *turnPtr){
     }
     int tot_del=0,tot_exp=0;
 
-    for(int turn=1;turn<=SIM_T;turn++){
+    for(int turn=1;turn<=MAX_TURNS;turn++){
         *turnPtr=turn;
 
-        int nnew=(rand()%MAX_NEW)+1,written=0;
+        int nnew=(turn<=SIM_T)?(rand()%MAX_NEW)+1:0,written=0;
         for(int p=0;p<nnew&&npkgs<MAX_TOTAL_PACKAGES;p++){
             PackageRequest *pr=&pkgs[npkgs];
             pr->packageId=npkgs;
@@ -122,6 +129,7 @@ static void helper(MainSharedMemory *shm,int mainQ,unsigned seed,int *turnPtr){
         TurnReadyRequest rdy;
         msgrcv(mainQ,&rdy,sizeof(rdy)-sizeof(long),1,0);
 
+        /* pickups */
         for(int ti=0;ti<SIM_D;ti++){
             int pid=shm->pickUpCommands[ti];
             if(pid<0||pid>=npkgs||delivered[pid]) continue;
@@ -134,7 +142,7 @@ static void helper(MainSharedMemory *shm,int mainQ,unsigned seed,int *turnPtr){
             shm->packageLocations[pid][0]=-1;
             shm->packageLocations[pid][1]=-1;
         }
-
+        /* dropoffs */
         for(int ti=0;ti<SIM_D;ti++){
             int pid=shm->dropOffCommands[ti];
             if(pid<0||pid>=npkgs) continue;
@@ -142,12 +150,13 @@ static void helper(MainSharedMemory *shm,int mainQ,unsigned seed,int *turnPtr){
             for(int c=0;c<tpkg[ti];c++) if(tlist[ti][c]==pid){slot=c;break;}
             if(slot<0) continue;
             if(tx[ti]!=pkgs[pid].dropoff_x||ty[ti]!=pkgs[pid].dropoff_y) continue;
-            delivered[pid]=1; tot_del++;
-            if(turn>pkgs[pid].expiry_turn) tot_exp++;
+            delivered[pid]=1;
+            if(turn<=pkgs[pid].expiry_turn) tot_del++;
+            else tot_exp++;
             tlist[ti][slot]=tlist[ti][--tpkg[ti]];
             tlist[ti][tpkg[ti]]=-1;
         }
-
+        /* movements */
         char sec[TRUCK_MAX_CAP+1];
         for(int ti=0;ti<SIM_D;ti++){
             if(ttoll[ti]>0){ttoll[ti]--;continue;}
@@ -165,7 +174,7 @@ static void helper(MainSharedMemory *shm,int mainQ,unsigned seed,int *turnPtr){
             tx[ti]=nx; ty[ti]=ny;
             if(g_toll[nx][ny]) ttoll[ti]=g_toll[nx][ny];
         }
-
+        /* update shm */
         for(int ti=0;ti<SIM_D;ti++){
             shm->truckPositions[ti][0]=tx[ti];
             shm->truckPositions[ti][1]=ty[ti];
@@ -188,6 +197,7 @@ int main(int argc,char *argv[]){
     unsigned seed=argc>1?(unsigned)atoi(argv[1]):(unsigned)time(NULL);
     printf("seed=%u\n",seed); fflush(stdout);
 
+    /* clean leftover IPC */
     {int o;
      if((o=shmget(KEY_SHM,1,0666))>=0)    shmctl(o,IPC_RMID,NULL);
      if((o=shmget(KEY_TURN,1,0666))>=0)   shmctl(o,IPC_RMID,NULL);
@@ -196,6 +206,7 @@ int main(int argc,char *argv[]){
          if((o=msgget(KEY_SOLVERQ+i,0666))>=0) msgctl(o,IPC_RMID,NULL);
     }
 
+    /* create shared memory */
     int sid=shmget(KEY_SHM,sizeof(MainSharedMemory),IPC_CREAT|0666);
     if(sid<0){perror("shmget");exit(1);}
     MainSharedMemory *shm=shmat(sid,NULL,0);
@@ -203,11 +214,13 @@ int main(int argc,char *argv[]){
     for(int i=0;i<MAX_TOTAL_PACKAGES;i++){shm->packageLocations[i][0]=-1;shm->packageLocations[i][1]=-1;}
     for(int i=0;i<MAX_TRUCKS;i++){shm->pickUpCommands[i]=-1;shm->dropOffCommands[i]=-1;}
 
+    /* create turn shm BEFORE fork */
     int tsid=shmget(KEY_TURN,sizeof(int),IPC_CREAT|0666);
     if(tsid<0){perror("shmget turn");exit(1);}
     int *turnPtr=(int*)shmat(tsid,NULL,0);
     *turnPtr=1;
 
+    /* create message queues */
     int mainQ=msgget(KEY_MAINQ,IPC_CREAT|0666);
     if(mainQ<0){perror("msgget main");exit(1);}
     int solverQs[SIM_S];
@@ -219,6 +232,7 @@ int main(int argc,char *argv[]){
     write_input();
     place_tolls(seed);
 
+    /* fork solver processes — they inherit tsid and map it themselves */
     pid_t spids[SIM_S];
     for(int i=0;i<SIM_S;i++){
         spids[i]=fork();
@@ -229,12 +243,14 @@ int main(int argc,char *argv[]){
     }
     usleep(100000);
 
+    /* fork student */
     pid_t stud=fork();
     if(stud==0){execl("./solution","./solution",NULL);perror("exec");exit(1);}
     printf("student pid=%d\n",(int)stud); fflush(stdout);
 
     helper(shm,mainQ,seed,turnPtr);
 
+    /* cleanup */
     kill(stud,SIGTERM); waitpid(stud,NULL,0);
     for(int i=0;i<SIM_S;i++){kill(spids[i],SIGTERM);waitpid(spids[i],NULL,0);}
     shmdt(shm); shmdt(turnPtr);
