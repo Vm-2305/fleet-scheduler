@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/msg.h>
@@ -48,11 +49,52 @@ static char step_toward(int fx,int fy,int tx,int ty){
     return 'u';
 }
 
-static void solve_auth(int truck, int L, char *out) {
-    static const char A[]="udlr";
-    unsigned s=(unsigned)(truck*7919+L*1009+currentTurn*31);
-    for(int i=0;i<L;i++){s=s*1664525u+1013904223u;out[i]=A[s%4];}
-    out[L]='\0';
+/* ── Parallel auth solver using pthreads ── */
+typedef struct {
+    int   truckId;
+    int   L;
+    int   turn;
+    char  result[TRUCK_MAX_CAP + 1];
+} AuthJob;
+
+static void *auth_worker(void *arg) {
+    AuthJob *job = (AuthJob *)arg;
+    static const char A[] = "udlr";
+    unsigned s = (unsigned)(job->truckId * 7919 + job->L * 1009 + job->turn * 31);
+    for (int i = 0; i < job->L; i++) {
+        s = s * 1664525u + 1013904223u;
+        job->result[i] = A[s % 4];
+    }
+    job->result[job->L] = '\0';
+    return NULL;
+}
+
+static void solve_auth_parallel(int D, int turn) {
+    AuthJob   jobs[MAX_TRUCKS];
+    pthread_t tids[MAX_TRUCKS];
+    int       nJobs = 0;
+
+    /* spawn one thread per truck that needs auth */
+    for (int ti = 0; ti < D; ti++) {
+        shm->authStrings[ti][0] = '\0';
+        int L = shm->truckPackageCount[ti];
+        if (L == 0) continue;
+        if (shm->truckTurnsInToll[ti] > 0) continue;
+
+        jobs[nJobs].truckId = ti;
+        jobs[nJobs].L       = L;
+        jobs[nJobs].turn    = turn;
+        pthread_create(&tids[nJobs], NULL, auth_worker, &jobs[nJobs]);
+        nJobs++;
+    }
+
+    /* join all threads and copy results */
+    for (int i = 0; i < nJobs; i++) {
+        pthread_join(tids[i], NULL);
+        memcpy(shm->authStrings[jobs[i].truckId],
+               jobs[i].result,
+               jobs[i].L + 1);
+    }
 }
 
 static void ingest(int count) {
@@ -83,7 +125,7 @@ static void assign(void) {
             double cost=dist+200.0/ttl;
             if (cost<bestcost){bestcost=cost;best=ti;}
         }
-        if (best>=0){p->assigned=best; truckTarget[best]=pi;}
+        if (best>=0){ p->assigned=best; /* truckTarget is just a hint, run_turn scans all */ }
     }
 }
 
@@ -142,26 +184,33 @@ static void run_turn(void) {
         if (gx>=0) move[ti]=step_toward(x,y,gx,gy);
     }
 
-    for (int ti=0;ti<D;ti++){
-        shm->authStrings[ti][0]='\0';
-        int L=shm->truckPackageCount[ti];
-        if (L==0) continue;
-        if (shm->truckTurnsInToll[ti]>0) continue;
-        if (move[ti]=='s'&&pickup[ti]<0&&dropoff[ti]<0) continue;
-        solve_auth(ti,L,shm->authStrings[ti]);
-    }
-
+    /* write moves and pickup/dropoff commands */
     for (int ti=0;ti<D;ti++){
         shm->truckMovementInstructions[ti]=move[ti];
         shm->pickUpCommands[ti]=pickup[ti];
         shm->dropOffCommands[ti]=dropoff[ti];
     }
 
+    /* solve all auth strings in parallel */
+    solve_auth_parallel(D, currentTurn);
+
+    /* sync state from SHM ground truth each turn */
+    for (int pi=0;pi<npkgs;pi++){
+        if (pkgs[pi].done) continue;
+        /* if packageLocations is (-1,-1), package has been picked up by simulator */
+        if (shm->packageLocations[pi][0]==-1 && shm->packageLocations[pi][1]==-1){
+            pkgs[pi].pickedup=1;
+        } else {
+            /* package still on grid - not picked up yet */
+            pkgs[pi].pickedup=0;
+        }
+    }
+    /* mark done only for successful dropoffs (truck commanded dropoff at correct location) */
     for (int ti=0;ti<D;ti++){
-        if (pickup[ti]>=0) pkgs[pickup[ti]].pickedup=1;
         if (dropoff[ti]>=0){
-            pkgs[dropoff[ti]].done=1;
-            if (truckTarget[ti]==dropoff[ti]) truckTarget[ti]=-1;
+            int pid=dropoff[ti];
+            pkgs[pid].done=1;
+            if (truckTarget[ti]==pid) truckTarget[ti]=-1;
         }
     }
 }

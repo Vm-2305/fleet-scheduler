@@ -11,13 +11,13 @@
 #include <signal.h>
 #include "shared.h"
 
-#define SIM_N   3
-#define SIM_D   2
+#define SIM_N  10
+#define SIM_D   3
 #define SIM_S   2
-#define SIM_T   7
-#define MAX_TURNS 500
-#define SIM_B   1
-#define MAX_NEW 1
+#define SIM_T    50   /* last turn new packages arrive */
+#define MAX_TURNS 2000 /* keep running until all delivered */
+#define SIM_B   3
+#define MAX_NEW 4
 
 /* Use small positive keys to avoid overflow */
 #define KEY_SHM     0x0F110001
